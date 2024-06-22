@@ -5,6 +5,8 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
+#include <cstdint>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
@@ -14,6 +16,11 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/error.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+#include "stb_vorbis.c"
+#include <functional>
+#include <mutex>
 
 using namespace std;
 using namespace std::chrono;
@@ -25,8 +32,38 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-const char *STREAM_URL = "https://listen.moe/kpop/stream";
-// const char* STREAM_URL = "https://example.com/";
+mutex rawdata_mutex;
+
+void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uint32 frameCount)
+{
+    lock_guard guard(rawdata_mutex);
+    // cout << "Callback called, reading " << frameCount << " frames" << endl;
+    vector<vector<float>> &rawdata = *(vector<vector<float>> *)pDevice->pUserData;
+    if (rawdata.size() == 0 || rawdata[0].size() < frameCount) {
+        return;
+    }
+    int index = 0;
+    for (int i = 0; i < frameCount; i++)
+    {
+        for (const auto &channel : rawdata)
+        {
+            if (i >= channel.size())
+            {
+                return;
+            }
+            else
+            {
+                ((float *)(pOutput))[index] = channel[i];
+            }
+            index++;
+        }
+    }
+    for (auto &channel : rawdata)
+    {
+        int toRemove = min(channel.size(), (size_t)frameCount);
+        channel.erase(channel.begin(), channel.begin() + toRemove);
+    }
+};
 
 int main()
 {
@@ -64,28 +101,120 @@ int main()
         http::write(stream, req);
 
         beast::flat_buffer buffer;
-        
 
-        // http::response<http::dynamic_body> res;
-        // http::read(stream, buffer, res);
         http::parser<false, http::buffer_body> p;
         http::read_header(stream, buffer, p);
-        cerr << "Read " << buffer.size() << " bytes :)" << endl;
-        
+
         beast::error_code ec{};
+
+        vector<uint8_t> vorbisdata;
+        stb_vorbis *vorbis = nullptr;
+
+        vector<vector<float>> rawdata;
+
+        ma_device_config config = ma_device_config_init(ma_device_type_playback);
+        config.playback.format = ma_format_f32;
+        config.playback.channels = 2;
+        config.sampleRate = 44100;
+        config.dataCallback = data_callback;
+        config.pUserData = (void *)&rawdata;
+
+        ma_device device;
+        if (ma_device_init(NULL, &config, &device) != MA_SUCCESS)
+        {
+            cerr << "Failed to initialize miniaudio device :(" << endl;
+            return -1;
+        }
+
+        bool ma_device_started = false;
+        constexpr size_t BUFFER_SIZE = 10 * 1024 * 1024;
+        uint8_t *buf = new uint8_t[BUFFER_SIZE];
+
         while (!p.is_done())
         {
-            char buf[1024] = {0};
             p.get().body().data = buf;
-            p.get().body().size = sizeof(buf);
+            p.get().body().size = BUFFER_SIZE;
             size_t read = http::read_some(stream, buffer, p, ec);
-            cerr << "Read " << read << " bytes :) " << endl;
             if (ec && ec != http::error::need_buffer)
+            {
                 break;
+            }
             for (int i = 0; i < read; i++)
-                cout << buf[i];
-            cout.flush();
+            {
+                vorbisdata.push_back(buf[i]);
+            }
+            if (vorbis == nullptr)
+            {
+                const uint8_t *datablock = vorbisdata.data();
+                int datablock_length = vorbisdata.size();
+                int datablock_memory_consumed = 0;        // Filled by function
+                int error = 0;                            // Filled by function
+                stb_vorbis_alloc *alloc_buffer = nullptr; // Use malloc
+                vorbis = stb_vorbis_open_pushdata(datablock,
+                                                  datablock_length,
+                                                  &datablock_memory_consumed,
+                                                  &error,
+                                                  alloc_buffer);
+                if (vorbis == nullptr && error != STBVorbisError::VORBIS_need_more_data)
+                {
+                    cerr << "Got error during decode: " << error << endl;
+                }
+                else
+                {
+                    vorbisdata.erase(vorbisdata.begin(),
+                                     vorbisdata.begin() + datablock_memory_consumed);
+                }
+            }
+            else
+            {
+                // TODO: Handle comments
+                lock_guard guard(rawdata_mutex);
+                bool has_more_to_read = true;
+                while (has_more_to_read)
+                {
+                    const uint8_t *datablock = vorbisdata.data();
+                    int datablock_length = vorbisdata.size();
+                    int channels = 0;         // To be filled by function
+                    float **output = nullptr; // To be filled by function
+                    int samples = 0;          // To be filled by function
+                    int bytes_read = stb_vorbis_decode_frame_pushdata(vorbis,
+                                                                      datablock,
+                                                                      datablock_length,
+                                                                      &channels,
+                                                                      &output,
+                                                                      &samples);
+                    if (bytes_read != 0 && channels != 0)
+                    {
+                        // cout << "Buffering up " << samples << " samples" << endl;
+                        while (channels > rawdata.size())
+                        {
+                            rawdata.push_back(vector<float>());
+                        }
+                        for (int j = 0; j < channels; j++)
+                        {
+                            for (int i = 0; i < samples; i++)
+                            {
+                                rawdata[j].push_back(output[j][i]);
+                            }
+                        }
+                        vorbisdata.erase(vorbisdata.begin(),
+                                         vorbisdata.begin() + bytes_read);
+                        // cout << "Rawdata size is " << rawdata[0].size() << endl;
+                    }
+                    else
+                    {
+                        has_more_to_read = false;
+                    }
+                }
+            }
+            if (!ma_device_started && rawdata.size() > 0 && rawdata[0].size() > 44100)
+            {
+                // cout << "Starting up ma device" << endl;
+                ma_device_start(&device);
+            }
         }
+        ma_device_uninit(&device);
+        delete[] buf;
     }
     catch (std::exception const &e)
     {
