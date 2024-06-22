@@ -39,7 +39,8 @@ void data_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
     lock_guard guard(rawdata_mutex);
     // cout << "Callback called, reading " << frameCount << " frames" << endl;
     vector<vector<float>> &rawdata = *(vector<vector<float>> *)pDevice->pUserData;
-    if (rawdata.size() == 0 || rawdata[0].size() < frameCount) {
+    if (rawdata.size() == 0 || rawdata[0].size() < frameCount)
+    {
         return;
     }
     int index = 0;
@@ -183,27 +184,34 @@ int main()
                                                                       &channels,
                                                                       &output,
                                                                       &samples);
-                    if (bytes_read != 0 && channels != 0)
+                    if (bytes_read != 0)
                     {
-                        // cout << "Buffering up " << samples << " samples" << endl;
-                        while (channels > rawdata.size())
+                        if (channels != 0)
                         {
-                            rawdata.push_back(vector<float>());
-                        }
-                        for (int j = 0; j < channels; j++)
-                        {
-                            for (int i = 0; i < samples; i++)
+                            while (channels > rawdata.size())
                             {
-                                rawdata[j].push_back(output[j][i]);
+                                rawdata.push_back(vector<float>());
+                            }
+                            for (int j = 0; j < channels; j++)
+                            {
+                                for (int i = 0; i < samples; i++)
+                                {
+                                    rawdata[j].push_back(output[j][i]);
+                                }
                             }
                         }
                         vorbisdata.erase(vorbisdata.begin(),
                                          vorbisdata.begin() + bytes_read);
-                        // cout << "Rawdata size is " << rawdata[0].size() << endl;
                     }
                     else
                     {
+                        // TODO: Fix new song transition
+                        int error = stb_vorbis_get_error(vorbis);
+                        if (error != 0 && error != VORBIS_need_more_data) {
+                            cerr << error << endl;
+                        }
                         has_more_to_read = false;
+                        
                     }
                 }
             }
